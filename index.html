@@ -923,23 +923,33 @@ const PIPED_INSTANCES=[
   'https://piped.video/api',
   'https://pipedapi.leptons.xyz'
 ];
-let _pipedIdx=0;
 let _pipedBase=PIPED_INSTANCES[0];
-// Try every instance before giving up
-async function pipedFetch(path,attempt=0){
-  const base=PIPED_INSTANCES[attempt%PIPED_INSTANCES.length];
+
+// Fetch with a hard timeout so slow instances fail fast
+async function _fetchWithTimeout(url,ms=5000){
+  const ctrl=new AbortController();
+  const tid=setTimeout(()=>ctrl.abort(),ms);
   try{
-    const r=await fetch(base+path,{headers:{'Accept':'application/json'}});
+    const r=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
+    clearTimeout(tid);
     if(!r.ok) throw new Error('HTTP '+r.status);
-    const j=await r.json();
-    _pipedBase=base; // remember working instance
+    return await r.json();
+  }catch(e){clearTimeout(tid);throw e;}
+}
+
+// Try last-known-good instance first; if it fails, race all others in parallel
+async function pipedFetch(path){
+  try{
+    const j=await _fetchWithTimeout(_pipedBase+path,5000);
     return j;
-  }catch(e){
-    if(attempt+1 < PIPED_INSTANCES.length){
-      return pipedFetch(path, attempt+1);
-    }
-    throw new Error('All Piped instances failed. Check your internet connection.');
-  }
+  }catch(e){}
+  const others=PIPED_INSTANCES.filter(b=>b!==_pipedBase);
+  const j=await Promise.any(others.map(async base=>{
+    const data=await _fetchWithTimeout(base+path,8000);
+    _pipedBase=base;
+    return data;
+  }));
+  return j;
 }
 
 /* Parse a Piped stream/search item into our internal video object */
@@ -991,13 +1001,49 @@ async function fetchTrending(pt=''){
   return{videos:items.map(parsePipedItem).filter(v=>v.id),nextPageToken:''};
 }
 
+// YouTube RSS feed fallback — returns popular videos without any API key
+async function fetchYouTubeFallback(){
+  // Use a CORS proxy to fetch YouTube's trending RSS
+  const feeds=[
+    'https://www.youtube.com/feeds/videos.xml?chart=mostpopular&hl=en&gl=US',
+  ];
+  for(const feed of feeds){
+    try{
+      const proxy=`https://api.allorigins.win/get?url=${encodeURIComponent(feed)}`;
+      const r=await _fetchWithTimeout(proxy,8000);
+      if(!r?.contents) continue;
+      const parser=new DOMParser();
+      const doc=parser.parseFromString(r.contents,'application/xml');
+      const entries=[...doc.querySelectorAll('entry')];
+      if(!entries.length) continue;
+      const videos=entries.slice(0,20).map(e=>{
+        const id=e.querySelector('videoId')?.textContent||e.querySelector('id')?.textContent?.split(':').pop()||'';
+        const title=e.querySelector('title')?.textContent||'';
+        const author=e.querySelector('author name')?.textContent||'';
+        const views=parseInt(e.querySelector('statistics')?.getAttribute('views')||'0')||0;
+        const published=e.querySelector('published')?.textContent||'';
+        return{
+          id,title,channel:author,channelId:'',
+          thumbnail:`https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
+          description:'',views,likes:0,duration:'',durationSecs:0,
+          uploaded:published,avatarUrl:''
+        };
+      }).filter(v=>v.id);
+      if(videos.length) return{videos,nextPageToken:''};
+    }catch(e){}
+  }
+  throw new Error('All fallbacks failed');
+}
+
 async function fetchHome(){
   const prefs=getPrefs(),hist=getHistory();
   if(hist.length>=2&&prefs.personalised!==false){
     const q=hist.slice(0,5).map(h=>h.title).join(' ').split(/\s+/).filter(w=>w.length>4).slice(0,6).join(' ')||'trending';
     try{const r=await searchVideos(q);if(r.videos.length)return r;}catch(e){}
   }
-  return fetchTrending();
+  // Try Piped trending first, then fall back to YouTube RSS
+  try{return await fetchTrending();}catch(e){}
+  return fetchYouTubeFallback();
 }
 
 async function fetchVideoDetails(id){
@@ -1118,7 +1164,16 @@ async function loadCat(cat){
     renderVideoGrid(currentVideos);document.getElementById('sectionCount').textContent=currentVideos.length+' videos';
     if(nextPageToken)document.getElementById('loadMoreWrap').style.display='flex';
     fetchChannelAvatars([...new Set(currentVideos.map(v=>v.channelId).filter(Boolean))]).then(()=>{currentVideos.forEach(v=>{v.avatarUrl=channelAvatarCache[v.channelId]||'';});renderVideoGrid(currentVideos);});
-  }catch(e){showErr('videoGrid','Could not load videos. Check your internet connection.');console.error(e);}
+  }catch(e){
+    console.error(e);
+    document.getElementById('videoGrid').innerHTML=`
+      <div class="err-msg">
+        <strong>Could not load videos</strong>
+        All video sources are currently unavailable.<br>
+        <button onclick="loadCat('${cat}')" style="margin-top:14px;padding:10px 24px;background:var(--red);color:#fff;border:none;border-radius:20px;font-size:14px;font-weight:600;cursor:pointer;">Retry</button>
+        <br><span style="font-size:12px;color:var(--t3);margin-top:8px;display:block;">Try searching for a specific video instead</span>
+      </div>`;
+  }
 }
 async function loadMore(){
   if(!nextPageToken)return;const btn=document.getElementById('loadMoreBtn');btn.textContent='Loading…';
