@@ -910,46 +910,14 @@ document.getElementById('togAutoplay').onclick=function(){
 };
 
 /* ============================================================
-   PIPED API  (replaces YouTube Data API — no quota)
+   API  — all calls go through the Render backend (no CORS issues)
 ============================================================ */
-const PIPED_INSTANCES=[
-  'https://pipedapi.kavin.rocks',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.adminforge.de',
-  'https://piped-api.codeberg.page',
-  'https://api.piped.yt',
-  'https://pipedapi.tokhmi.xyz',
-  'https://piped.video/api',
-  'https://pipedapi.leptons.xyz'
-];
-let _pipedBase=PIPED_INSTANCES[0];
-
-// Fetch with a hard timeout so slow instances fail fast
-async function _fetchWithTimeout(url,ms=5000){
-  const ctrl=new AbortController();
-  const tid=setTimeout(()=>ctrl.abort(),ms);
-  try{
-    const r=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
-    clearTimeout(tid);
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return await r.json();
-  }catch(e){clearTimeout(tid);throw e;}
-}
-
-// Try last-known-good instance first; if it fails, race all others in parallel
+// pipedFetch: routes through our own backend which proxies Piped server-side
 async function pipedFetch(path){
-  try{
-    const j=await _fetchWithTimeout(_pipedBase+path,5000);
-    return j;
-  }catch(e){}
-  const others=PIPED_INSTANCES.filter(b=>b!==_pipedBase);
-  const j=await Promise.any(others.map(async base=>{
-    const data=await _fetchWithTimeout(base+path,8000);
-    _pipedBase=base;
-    return data;
-  }));
-  return j;
+  const url=BACKEND_URL+path;
+  const r=await fetch(url,{headers:{'Accept':'application/json'}});
+  if(!r.ok) throw new Error('Backend error: HTTP '+r.status);
+  return r.json();
 }
 
 /* Parse a Piped stream/search item into our internal video object */
@@ -1001,49 +969,13 @@ async function fetchTrending(pt=''){
   return{videos:items.map(parsePipedItem).filter(v=>v.id),nextPageToken:''};
 }
 
-// YouTube RSS feed fallback — returns popular videos without any API key
-async function fetchYouTubeFallback(){
-  // Use a CORS proxy to fetch YouTube's trending RSS
-  const feeds=[
-    'https://www.youtube.com/feeds/videos.xml?chart=mostpopular&hl=en&gl=US',
-  ];
-  for(const feed of feeds){
-    try{
-      const proxy=`https://api.allorigins.win/get?url=${encodeURIComponent(feed)}`;
-      const r=await _fetchWithTimeout(proxy,8000);
-      if(!r?.contents) continue;
-      const parser=new DOMParser();
-      const doc=parser.parseFromString(r.contents,'application/xml');
-      const entries=[...doc.querySelectorAll('entry')];
-      if(!entries.length) continue;
-      const videos=entries.slice(0,20).map(e=>{
-        const id=e.querySelector('videoId')?.textContent||e.querySelector('id')?.textContent?.split(':').pop()||'';
-        const title=e.querySelector('title')?.textContent||'';
-        const author=e.querySelector('author name')?.textContent||'';
-        const views=parseInt(e.querySelector('statistics')?.getAttribute('views')||'0')||0;
-        const published=e.querySelector('published')?.textContent||'';
-        return{
-          id,title,channel:author,channelId:'',
-          thumbnail:`https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
-          description:'',views,likes:0,duration:'',durationSecs:0,
-          uploaded:published,avatarUrl:''
-        };
-      }).filter(v=>v.id);
-      if(videos.length) return{videos,nextPageToken:''};
-    }catch(e){}
-  }
-  throw new Error('All fallbacks failed');
-}
-
 async function fetchHome(){
   const prefs=getPrefs(),hist=getHistory();
   if(hist.length>=2&&prefs.personalised!==false){
     const q=hist.slice(0,5).map(h=>h.title).join(' ').split(/\s+/).filter(w=>w.length>4).slice(0,6).join(' ')||'trending';
     try{const r=await searchVideos(q);if(r.videos.length)return r;}catch(e){}
   }
-  // Try Piped trending first, then fall back to YouTube RSS
-  try{return await fetchTrending();}catch(e){}
-  return fetchYouTubeFallback();
+  return fetchTrending();
 }
 
 async function fetchVideoDetails(id){
